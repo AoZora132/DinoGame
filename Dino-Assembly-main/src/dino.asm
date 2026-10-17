@@ -34,12 +34,18 @@ dinoX equ 30          ; dino's x level from the left edge
 dinoStart equ 135     ; dino's y when standing (ground 150 - dino height 15)
 
 ; ----- Moving Cloud -----
-cloudW       equ 40     ; cloud sprite width  (pixels)
-cloudH       equ 8      ; cloud sprite height (pixels)
-cloudY       equ 30     ; y of the cloud (below the top border)
-cloudStartX  equ 278    ; x where the cloud appears (right side)
-cloudEndX    equ 4      ; at or below this x, the cloud restarts
-cloudSpeed   equ 1      ; pixels per frame (the ground moves 3)
+cloudW       equ 40     ; cloud sprite width
+cloudH       equ 8      ; cloud sprite height
+cloudStartX  equ 296    ; x where a new cloud appears (right side)
+cloudEndX    equ 4      ; at or below this x, the cloud is removed
+cloudSpeed   equ 1      ; pixels per frame
+
+maxClouds      equ 3
+cloudLevels    equ 4
+cloudTopY      equ 10
+cloudLevelGap  equ 14
+spawnMin       equ 30
+spawnRange     equ 90
 
 ; --- used for vertical movement calculation ---
 jumpSpeed equ -10     ; starting speed, negative (explanation on docs/github. READ IT)
@@ -59,6 +65,7 @@ Start:
     mov ax, 0A000h    ; set video segment
     mov es, ax
     cld
+    call Init_Random 
 
     ; ----- creating the frame -----
     ; white background
@@ -120,7 +127,9 @@ Game_Loop:
     call Wait_Vsync      ; wait again = half speed (about 35 FPS)
     call Update_Ground   ; move the scroll position
     call Draw_Ground     ; redraw the ground at that position
-    call Move_Cloud      ; Create a moving cloud that moves left 
+    call Spawn_Cloud     ; Spawns a moving cloud that moves left 
+    call Move_Clouds     ; Moves The Clouds
+    
 
     ; --- check the keyboard ---
     mov ah, 1            ; is a key waiting?
@@ -278,39 +287,142 @@ Draw_Ground:
     pop bx
     pop ax
     ret
-    
-; ----- Move_Cloud: erase, move, draw the cloud ------
-Move_Cloud:
-    ; --- erase the old cloud (white box, same size) ---
-    mov ax, [cloud_x]    ; x
-    mov bx, cloudY       ; y
-    mov cx, cloudW       ; width
-    mov dx, cloudH       ; height
-    mov si, white        ; erase color
-    call Draw_Box
 
-    ; --- move the cloud left ---
-    mov ax, [cloud_x]
-    sub ax, cloudSpeed   ; x = x - speed
-    cmp ax, cloudEndX    ; still on screen?
-    jg .Store            ; yes, keep the new x
-    mov ax, cloudStartX  ; no, restart on the right side
-    
-    
-.Store:
-    mov [cloud_x], ax    ; save the new x
-
-    ; ----- draw the cloud at the new place -----
-    mov si, cloud_sprite ; which sprite
-    mov ax, [cloud_x]    ; x
-    mov bx, cloudY       ; y
-    mov cx, cloudW       ; width
-    mov dx, cloudH       ; height
-    call Draw_Sprite
+; ----- For Randomization -----
+Init_Random:
+    mov ah, 0                   ; BIOS function 0 = read the clock
+    int 1Ah                     ; cx:dx = clock ticks since midnight
+    mov [rand_seed], dx         ; use the low part as the seed
     ret
     
-; ---------- Draw_Sprite: draws a text sprite (space = transparent) ----------
-; ax = x, bx = y, cx = width, dx = height, si = address of the sprite
+Get_Random:
+    mov ax, [rand_seed]         ; ax = old seed
+    mov dx, 25173               ; the multiplier
+    mul dx                      ; dx:ax = ax * 25173 (we keep only ax)
+    add ax, 13849               ; add the increment
+    mov [rand_seed], ax         ; save as the new seed
+    ret
+    
+Random_Range:
+    push dx                     ; Get_Random and div change dx, so save it
+    call Get_Random             ; ax = random 16-bit number
+    mov al, ah                  ; use the HIGH byte (better random than the low)
+    xor ah, ah                  ; ax = 0..255
+    xor dx, dx                  ; clear dx before dividing (dx:ax / bx)
+    div bx                      ; ax = quotient, dx = remainder (0..n-1)
+    mov ax, dx                  ; the remainder is our result
+    pop dx                      ; restore dx
+    ret
+    
+; ----- Cloud Spawning -----
+Spawn_Cloud:
+    cmp word [spawn_timer], 0   ; has the countdown finished?
+    je .Time_To_Spawn           ; yes -> make a cloud
+    dec word [spawn_timer]      ; no  -> count one frame down
+    ret                         ; (nothing was pushed yet, so plain ret)
+ 
+.Time_To_Spawn:
+    push ax                     ; save the registers we change
+    push bx
+    push cx
+    push dx
+ 
+    xor bx, bx                  ; bx = slot offset (0, 2, 4 ... words are 2 bytes)
+.Find_Slot:
+    cmp word [clouds_on + bx], 0 ; is this slot free?
+    je .Found                   ; yes -> use it
+    add bx, 2                   ; no  -> try the next slot
+    cmp bx, maxClouds * 2       ; checked all slots?
+    jb .Find_Slot               ; no  -> keep looking
+    jmp .Reset_Timer            ; all slots full: skip this spawn
+ 
+.Found:
+    mov word [clouds_on + bx], 1        ; mark the slot as used
+    mov word [clouds_x + bx], cloudStartX ; start at the right side
+ 
+    push bx                     ; Random_Range needs bx, so save the slot offset
+    mov bx, cloudLevels         ; n = number of levels
+    call Random_Range           ; ax = random level 0 .. cloudLevels-1
+    mov cx, cloudLevelGap       ; cx = pixels between levels
+    mul cx                      ; ax = level * gap (dx is destroyed, we do not care)
+    add ax, cloudTopY           ; ax = y of that level
+    pop bx                      ; bx = slot offset again
+    mov [clouds_y + bx], ax     ; remember this cloud's y
+ 
+.Reset_Timer:
+    mov bx, spawnRange          ; n = size of the random extra time
+    call Random_Range           ; ax = random 0 .. spawnRange-1
+    add ax, spawnMin            ; add the minimum wait
+    mov [spawn_timer], ax       ; frames until the next cloud
+ 
+    pop dx                      ; restore registers in REVERSE order
+    pop cx
+    pop bx
+    pop ax
+    ret
+; ----- Move_Cloud: erase, move, draw the cloud ------
+Move_Clouds:
+    push ax                     ; save the registers we change
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+ 
+    ; erases all clouds
+    xor bx, bx                  ; bx = slot offset, start at slot 0
+.Erase_Loop:
+    cmp word [clouds_on + bx], 0 ; is the slot used?
+    je .Erase_Next              ; no  -> nothing to erase
+    push bx                     ; Draw_Box will destroy bx, so save it
+    mov ax, [clouds_x + bx]     ; ax = x of this cloud
+    mov cx, cloudW              ; cx = width
+    mov dx, cloudH              ; dx = height
+    mov bx, [clouds_y + bx]     ; bx = y of this cloud (read BEFORE bx changes)
+    mov si, white               ; erase color
+    call Draw_Box               ; paint a white box over the old cloud
+    pop bx                      ; bx = slot offset again
+.Erase_Next:
+    add bx, 2                   ; next slot
+    cmp bx, maxClouds * 2       ; went through all slots?
+    jb .Erase_Loop              ; no  -> continue
+ 
+    ; ===== PASS 2: move and draw all clouds =====
+    xor bx, bx                  ; back to slot 0
+.Move_Loop:
+    cmp word [clouds_on + bx], 0 ; is the slot used?
+    je .Move_Next               ; no  -> skip it
+ 
+    mov ax, [clouds_x + bx]     ; ax = current x
+    sub ax, cloudSpeed          ; move left
+    cmp ax, cloudEndX           ; still on screen?
+    jg .Still_On                ; yes -> keep it
+    mov word [clouds_on + bx], 0 ; no  -> free the slot (it was already erased)
+    jmp .Move_Next              ; and draw nothing
+ 
+.Still_On:
+    mov [clouds_x + bx], ax     ; save the new x
+    push bx                     ; Draw_Sprite needs bx = y, so save the slot offset
+    mov bx, [clouds_y + bx]     ; bx = y of this cloud
+    mov cx, cloudW              ; cx = width
+    mov dx, cloudH              ; dx = height
+    mov si, cloud_sprite        ; si = the sprite to draw (ax already = x)
+    call Draw_Sprite            ; draw the cloud at its new place
+    pop bx                      ; bx = slot offset again
+ 
+.Move_Next:
+    add bx, 2                   ; next slot
+    cmp bx, maxClouds * 2       ; went through all slots?
+    jb .Move_Loop               ; no  -> continue
+ 
+    pop di                      ; restore registers in REVERSE order
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
 Draw_Sprite:
     push ax                     ; save every register we change
     push bx
@@ -392,8 +504,12 @@ on_ground   db 1
 ground_scroll   dw 0            ; current scroll position (0 .. tileW-1)
 scroll_speed    dw 3            ; pixels the ground moves per frame
 
-cloud_x dw cloudStartX    ; current x of the cloud
- 
+rand_seed      dw 0                     ; current random number (set by Init_Random)
+spawn_timer    dw 0                     ; frames until the next cloud (0 = spawn now)
+clouds_x       times maxClouds dw 0     ; x of each cloud slot
+clouds_y       times maxClouds dw 0     ; y of each cloud slot
+clouds_on      times maxClouds dw 0     ; 1 = slot used, 0 = slot free
+
 ; Ground Sprite
 ground_tile:
     db "################################################################"
@@ -416,5 +532,4 @@ cloud_sprite:
     db "  ::                            ::      "
     db "    ::                          ::      "
     db "    ::::::::::::::::::::::::::::        "
-    Check_Size cloud_sprite, cloudW * cloudH
     Check_Size cloud_sprite, cloudW * cloudH

@@ -1,3 +1,4 @@
+;=====================================================================
 ; General Controls:
 ; Space = jump, ESC = quit
 ;=====================================================================
@@ -10,9 +11,35 @@
 org 100h
 
 ; ========== CONSTANTS ==========
+; ---- colors: default VGA palette in mode 13h ----
+colorBlack  equ 0           ; palette index 0  = black
+colorLight  equ 7           ; palette index 7  = light gray
+colorGray   equ 8           ; palette index 8  = dark gray (dino color)
+colorWhite  equ 15          ; palette index 15 = white (background / eraser)
+ 
+; ---- ground scrolling settings ----
+groundRows  equ 8           ; height of the ground tile in rows (pixels)
+tileW       equ 64          ; width of the ground tile in columns (pixels)
+fieldLeft   equ 2           ; first x we draw on. Set it just INSIDE your border
+fieldWidth  equ 316         ; how many columns we draw (320 - 8 - 8)
+ 
+; ---- size checker (used by the tile data and the sprites) ----
+%macro Check_Size 2
+    times ($ - %1) - (%2) db 0      ; error here = data is too SHORT
+    times (%2) - ($ - %1) db 0      ; error here = data is too LONG
+%endmacro
+
 ground equ 150        ; y level of the ground line, counted from the TOP of the screen
 dinoX equ 30          ; dino's x level from the left edge
 dinoStart equ 135     ; dino's y when standing (ground 150 - dino height 15)
+
+; ----- Moving Cloud -----
+cloudW       equ 40     ; cloud sprite width  (pixels)
+cloudH       equ 8      ; cloud sprite height (pixels)
+cloudY       equ 30     ; y of the cloud (below the top border)
+cloudStartX  equ 278    ; x where the cloud appears (right side)
+cloudEndX    equ 4      ; at or below this x, the cloud restarts
+cloudSpeed   equ 1      ; pixels per frame (the ground moves 3)
 
 ; --- used for vertical movement calculation ---
 jumpSpeed equ -10     ; starting speed, negative (explanation on docs/github. READ IT)
@@ -33,9 +60,7 @@ Start:
     mov es, ax
     cld
 
-    ; --- creating the frame ---
-    ; refer to docs/github for what the registers mean in this context
-
+    ; ----- creating the frame -----
     ; white background
     mov ax, 0
     mov bx, 0
@@ -93,6 +118,9 @@ Start:
 Game_Loop:
     call Wait_Vsync      ; wait for one screen refresh
     call Wait_Vsync      ; wait again = half speed (about 35 FPS)
+    call Update_Ground   ; move the scroll position
+    call Draw_Ground     ; redraw the ground at that position
+    call Move_Cloud      ; Create a moving cloud that moves left 
 
     ; --- check the keyboard ---
     mov ah, 1            ; is a key waiting?
@@ -185,9 +213,208 @@ Wait_Start:
     jz Wait_Start        ; wait until the next one starts
     ret
 
+; ----- Udates the Ground -----
+Update_Ground:
+    push ax                     ; save ax so the caller's value survives
+ 
+    mov ax, [ground_scroll]     ; ax = current scroll position
+    add ax, [scroll_speed]      ; move it by the speed (pixels per frame)
+ 
+    cmp ax, tileW               ; did we go past the end of the tile?
+    jb .Store                   ; no  -> keep the value as it is
+    sub ax, tileW               ; yes -> wrap around (keeps the leftover pixels,
+                                ;        so the speed stays smooth)
+.Store:
+    mov [ground_scroll], ax     ; save the new scroll position
+ 
+    pop ax                      ; restore ax
+    ret
+
+; ----- Draws The Ground -----
+Draw_Ground:
+    push ax                     ; save every register we change
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push es
+ 
+    mov ax, 0A000h              ; segment of VGA video memory
+    mov es, ax                  ; es:di now points at screen pixels
+ 
+    mov di, ground * 320 + fieldLeft ; di = offset of the first ground pixel
+                                ;        (offset = y * 320 + x)
+    mov si, ground_tile         ; si = first text row of the tile
+    mov dl, groundRows          ; dl = number of rows still to draw
+ 
+.Row_Loop:                      ; ----- one text row of the tile per pass -----
+    mov bx, [ground_scroll]     ; bx = tile column where this row starts
+    mov cx, fieldWidth          ; cx = how many pixels to draw in this row
+ 
+.Pixel_Loop:                    ; ----- one pixel per pass -----
+    mov al, [si + bx]           ; al = the character at tile column bx
+    call Char_To_Color          ; al = palette color for that character
+    mov [es:di], al             ; write the pixel to the screen
+    inc di                      ; next pixel to the right on screen
+ 
+    inc bx                      ; next tile column
+    cmp bx, tileW               ; ran off the right edge of the tile?
+    jb .No_Wrap                 ; no  -> carry on
+    xor bx, bx                  ; yes -> jump back to tile column 0 (the loop!)
+.No_Wrap:
+    loop .Pixel_Loop            ; cx = cx - 1, repeat until cx is 0
+ 
+    add di, 320 - fieldWidth    ; di: back to the row start, then one line down
+    add si, tileW               ; si: next text row of the tile
+    dec dl                      ; one row finished
+    jnz .Row_Loop               ; more rows left? go again
+ 
+    pop es                      ; restore registers in REVERSE order
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+    
+; ----- Move_Cloud: erase, move, draw the cloud ------
+Move_Cloud:
+    ; --- erase the old cloud (white box, same size) ---
+    mov ax, [cloud_x]    ; x
+    mov bx, cloudY       ; y
+    mov cx, cloudW       ; width
+    mov dx, cloudH       ; height
+    mov si, white        ; erase color
+    call Draw_Box
+
+    ; --- move the cloud left ---
+    mov ax, [cloud_x]
+    sub ax, cloudSpeed   ; x = x - speed
+    cmp ax, cloudEndX    ; still on screen?
+    jg .Store            ; yes, keep the new x
+    mov ax, cloudStartX  ; no, restart on the right side
+    
+    
+.Store:
+    mov [cloud_x], ax    ; save the new x
+
+    ; ----- draw the cloud at the new place -----
+    mov si, cloud_sprite ; which sprite
+    mov ax, [cloud_x]    ; x
+    mov bx, cloudY       ; y
+    mov cx, cloudW       ; width
+    mov dx, cloudH       ; height
+    call Draw_Sprite
+    ret
+    
+; ---------- Draw_Sprite: draws a text sprite (space = transparent) ----------
+; ax = x, bx = y, cx = width, dx = height, si = address of the sprite
+Draw_Sprite:
+    push ax                     ; save every register we change
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push bp
+    push es
+
+    cld                         ; make lodsb move si FORWARD
+    mov di, ax                  ; di = x (for now)
+    mov ax, bx                  ; ax = y
+    mov bp, dx                  ; bp = height (mul destroys dx, so park it)
+    mov dx, 320                 ; one screen row = 320 bytes
+    mul dx                      ; ax = y * 320
+    add di, ax                  ; di = y * 320 + x = first pixel on screen
+    mov dx, bp                  ; dx = height again (rows left to draw)
+    mov bp, cx                  ; bp = width (needed again for every row)
+
+    mov ax, 0A000h              ; segment of VGA video memory
+    mov es, ax                  ; es:di now points at screen pixels
+
+.Row_Loop:                      ; ----- one sprite row per pass -----
+    mov cx, bp                  ; cx = pixels in this row
+    push di                     ; remember where this screen row starts
+
+.Pixel_Loop:                    ; ----- one pixel per pass -----
+    lodsb                       ; al = next sprite character, then si = si + 1
+    cmp al, ' '                 ; is it a space?
+    je .Skip                    ; yes -> transparent, leave the screen alone
+    call Char_To_Color          ; al = palette color
+    mov [es:di], al             ; write the pixel
+.Skip:
+    inc di                      ; next pixel to the right
+    loop .Pixel_Loop            ; cx = cx - 1, repeat until the row is done
+
+    pop di                      ; di = start of the row we just drew
+    add di, 320                 ; move down one screen row
+    dec dx                      ; one sprite row finished
+    jnz .Row_Loop               ; more rows? go again
+
+    pop es                      ; restore registers in REVERSE order
+    pop bp
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; ----- Converts Character into color -----
+Char_To_Color:
+    cmp al, '#'                 ; is it a body pixel?
+    je .Gray
+    cmp al, '@'                 ; is it a black detail pixel?
+    je .Black
+    cmp al, ':'                 ; is it a light gray pixel?
+    je .Light
+    mov al, colorWhite          ; anything else (space) = background white
+    ret
+.Gray:
+    mov al, colorGray
+    ret
+.Black:
+    mov al, colorBlack
+    ret
+.Light:
+    mov al, colorLight
+    ret
 
 ; ========== VARIABLES ==========
 box_width   dw 0
 dino_y      dw dinoStart
 speed       dw 0
 on_ground   db 1
+
+ground_scroll   dw 0            ; current scroll position (0 .. tileW-1)
+scroll_speed    dw 3            ; pixels the ground moves per frame
+
+cloud_x dw cloudStartX    ; current x of the cloud
+ 
+; Ground Sprite
+ground_tile:
+    db "################################################################"
+    db "         ##                           ###                       "
+    db "    ::                :::                    :                  "
+    db "              :                ::                         ::    "
+    db "       :                   :                     :              "
+    db "                  ::                :                        :  "
+    db "  :                                      ::                     "
+    db "            :                                        :          "
+    Check_Size ground_tile, tileW * groundRows
+
+; Cloud Sprite
+cloud_sprite:
+    db "            ::::::::                    "
+    db "            ::    ::                    "
+    db "      ::::::::    ::::::::::            "
+    db "      ::                  ::            "
+    db "  ::::::                  ::::::::      "
+    db "  ::                            ::      "
+    db "    ::                          ::      "
+    db "    ::::::::::::::::::::::::::::        "
+    Check_Size cloud_sprite, cloudW * cloudH
+    Check_Size cloud_sprite, cloudW * cloudH
